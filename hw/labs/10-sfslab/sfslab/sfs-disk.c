@@ -57,10 +57,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-//thread-safe lock
-#include <pthread.h>
-static pthread_mutex_t sfs_lock = PTHREAD_MUTEX_INITIALIZER;
-
 
 /** Maximum number of files that can exist.  Since we have not implemented
     expansion of the root directory, this is equal to the number of directory
@@ -71,6 +67,24 @@ static pthread_mutex_t sfs_lock = PTHREAD_MUTEX_INITIALIZER;
     than the number of files that can exist; some of the traces
     open the same file more than once.  */
 #define OPEN_FILE_LIMIT 32
+
+//thread-safe lock
+#include <pthread.h>
+static pthread_mutex_t sfs_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t free_list_lock = PTHREAD_MUTEX_INITIALIZER;
+#define MUTEX_PAIR PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER
+
+static pthread_mutex_t fd_locks[] = {
+    MUTEX_PAIR, MUTEX_PAIR, MUTEX_PAIR, MUTEX_PAIR,
+    MUTEX_PAIR, MUTEX_PAIR, MUTEX_PAIR, MUTEX_PAIR,
+    MUTEX_PAIR, MUTEX_PAIR, MUTEX_PAIR, MUTEX_PAIR,
+    MUTEX_PAIR, MUTEX_PAIR, MUTEX_PAIR, MUTEX_PAIR,
+};
+
+#undef MUTEX_PAIR
+
+static_assert(sizeof fd_locks / sizeof fd_locks[0] == OPEN_FILE_LIMIT,
+              "One mutex is required per descriptor slot");
 
 static_assert(sizeof(sfs_block_file_t) == SFS_BLOCK_SIZE,
               "SFS_BLOCK_SIZE and sfs_block_file_t are out of sync");
@@ -133,9 +147,12 @@ static size_t sizeMin(size_t a, size_t b)
     if N_BLOCKS is zero.  */
 static block_id allocateBlocks(uint32_t n_blocks, const char *type)
 {
+    pthread_mutex_lock(&free_list_lock);
+    block_id result = 0;
+
     sfs_filesystem_t *super = accessSuperBlock();
     if (super->freelist == 0 || n_blocks == 0)
-        return 0;
+        goto out;
 
     block_id first_alloc_id = super->freelist;
     sfs_block_hdr_t *first_alloc_blk = accessFreeBlock(first_alloc_id);
@@ -145,7 +162,7 @@ static block_id allocateBlocks(uint32_t n_blocks, const char *type)
     for (uint32_t i = 1; i < n_blocks; i++)
     {
         if (last_alloc_blk->next_block == 0)
-            return 0; // not enough free blocks available
+            goto out; // not enough free blocks available
         last_alloc_blk = accessFreeBlock(last_alloc_blk->next_block);
     }
 
@@ -166,7 +183,10 @@ static block_id allocateBlocks(uint32_t n_blocks, const char *type)
          b = accessFreeBlock(b->next_block))
         setBlockType(b, type);
 
-    return first_alloc_id;
+    result = first_alloc_id;
+out:
+    pthread_mutex_unlock(&free_list_lock);
+    return result;
 }
 
 /** Deallocate all of the blocks in the allocation chain starting at
@@ -175,6 +195,8 @@ static block_id allocateBlocks(uint32_t n_blocks, const char *type)
     first block in an allocation chain.  */
 static void freeBlocks(block_id first_block)
 {
+    pthread_mutex_lock(&free_list_lock);
+
     sfs_filesystem_t *superBlock = accessSuperBlock();
     sfs_block_hdr_t *b = accessBlock(first_block);
     if (b->prev_block != 0)
@@ -202,6 +224,7 @@ static void freeBlocks(block_id first_block)
         oldHead->prev_block = idOfBlock(b);
     }
     superBlock->freelist = first_block;
+    pthread_mutex_unlock(&free_list_lock);
 }
 
 /** Allocate an open-file-table entry and "file descriptor" referring
@@ -260,7 +283,10 @@ static int addOpenFileEntry(int entryIndex)
     memDescFile->startBlock = fileEntry->diskFile->first_block;
     memDescFile->currBlock = memDescFile->startBlock;
     memDescFile->currPos = 0;
+
+    pthread_mutex_lock(&fd_locks[fd]);
     openFileDescTable[fd] = memDescFile;
+    pthread_mutex_unlock(&fd_locks[fd]);
     return fd;
 }
 
@@ -390,17 +416,17 @@ void sfs_close(int fd)
         return;
 
     pthread_mutex_lock(&sfs_lock);
+    pthread_mutex_lock(&fd_locks[fd]);
+
     sfs_mem_filedesc_t *tFile = openFileDescTable[fd];
     if (!tFile)
         goto out;
     sfs_mem_file_t *fileEntry = tFile->fileEntry;
 
-    pthread_mutex_lock(&fileEntry->lock);
     openFileDescTable[fd] = NULL;
     free(tFile);
 
     fileEntry->refCount--;
-    pthread_mutex_unlock(&fileEntry->lock);
 
     if (fileEntry->refCount > 0)
         goto out;
@@ -410,6 +436,7 @@ void sfs_close(int fd)
     free(fileEntry);
     openFileTable[idx] = NULL;
 out:
+    pthread_mutex_unlock(&fd_locks[fd]);
     pthread_mutex_unlock(&sfs_lock);
 }
 
@@ -418,17 +445,17 @@ ssize_t sfs_read(int fd, char *buf, size_t len)
     if (fd < 0 || fd >= OPEN_FILE_LIMIT)
         return -EBADF;
 
-    pthread_mutex_lock(&sfs_lock);
+    pthread_mutex_lock(&fd_locks[fd]);
     sfs_mem_filedesc_t *tFile = openFileDescTable[fd];
     if (tFile == NULL)
     {
-        pthread_mutex_unlock(&sfs_lock);
+        pthread_mutex_unlock(&fd_locks[fd]);
         return -EBADF;
     }
 
     pthread_mutex_t *file_lock = &tFile->fileEntry->lock;
     pthread_mutex_lock(file_lock);
-    pthread_mutex_unlock(&sfs_lock);
+    
     // We are going to read 'len' bytes, or the amount of data remaining
     // in the file, whichever is smaller.
     // This subtraction cannot produce a value larger than SSIZE_MAX
@@ -483,7 +510,7 @@ ssize_t sfs_read(int fd, char *buf, size_t len)
     tFile->currPos = currPos + totalToRead;
 
     pthread_mutex_unlock(file_lock);
-
+    pthread_mutex_unlock(&fd_locks[fd]);
     return (ssize_t)totalToRead;
 }
 
@@ -492,7 +519,7 @@ ssize_t sfs_write(int fd, const char *buf, size_t len)
     if (fd < 0 || fd >= OPEN_FILE_LIMIT)
         return -EBADF;
 
-    pthread_mutex_lock(&sfs_lock);
+    pthread_mutex_lock(&fd_locks[fd]);
     ssize_t rv;
     sfs_mem_filedesc_t *tFile = openFileDescTable[fd];
     if (tFile == NULL)
@@ -543,8 +570,6 @@ ssize_t sfs_write(int fd, const char *buf, size_t len)
         }
     }
 
-    pthread_mutex_unlock(&sfs_lock);
-
     // Copy chunks of data from the caller's buffer to the mapped disk image.
     // See comments above the very similar loop in sfs_read() for more detail.
     sfs_block_file_t *diskBlock = accessFileBlock(tFile->currBlock);
@@ -590,13 +615,12 @@ ssize_t sfs_write(int fd, const char *buf, size_t len)
         assert(endPos <= SFS_MAX_FILE_SIZE);
         tFile->fileEntry->diskFile->size = (uint32_t)endPos;
     }
-    pthread_mutex_unlock(file_lock);
-    return (ssize_t)len;
+    rv = (ssize_t)len;
 
 out_file:
     pthread_mutex_unlock(file_lock);
 out:
-    pthread_mutex_unlock(&sfs_lock);
+    pthread_mutex_unlock(&fd_locks[fd]);
     return rv;
 }
 
@@ -608,21 +632,12 @@ ssize_t sfs_getpos(int fd)
     if (fd < 0 || fd >= OPEN_FILE_LIMIT)
         return -EBADF;
 
-    pthread_mutex_lock(&sfs_lock);
+    pthread_mutex_lock(&fd_locks[fd]);
     sfs_mem_filedesc_t *tFile = openFileDescTable[fd];
+    ssize_t result = tFile == NULL ? -EBADF : (ssize_t)tFile->currPos;
 
-    if (tFile == NULL)
-    {
-        pthread_mutex_unlock(&sfs_lock);
-        return -EBADF;
-    }
+    pthread_mutex_unlock(&fd_locks[fd]);
 
-    pthread_mutex_t *file_lock = &tFile->fileEntry->lock;
-    pthread_mutex_lock(file_lock);
-    pthread_mutex_unlock(&sfs_lock);
-
-    ssize_t result = (ssize_t)tFile->currPos;
-    pthread_mutex_unlock(file_lock);
     return result;
 }
 
@@ -634,17 +649,17 @@ ssize_t sfs_seek(int fd, ssize_t delta)
     if (fd < 0 || fd >= OPEN_FILE_LIMIT)
         return -EBADF;
 
-    pthread_mutex_lock(&sfs_lock);
+    pthread_mutex_lock(&fd_locks[fd]);
     sfs_mem_filedesc_t *tFile = openFileDescTable[fd];
     if (tFile == NULL)
     {
-        pthread_mutex_unlock(&sfs_lock);
+        pthread_mutex_unlock(&fd_locks[fd]);
         return -EBADF;
     }
 
     pthread_mutex_t *file_lock = &tFile->fileEntry->lock;
     pthread_mutex_lock(file_lock);
-    pthread_mutex_unlock(&sfs_lock);
+    
     ssize_t pos = (ssize_t)tFile->currPos;
     ssize_t fileSize = (ssize_t)tFile->fileEntry->diskFile->size;
     if (delta < -pos)
@@ -668,6 +683,7 @@ ssize_t sfs_seek(int fd, ssize_t delta)
     tFile->currPos = (size_t)pos;
 
     pthread_mutex_unlock(file_lock);
+    pthread_mutex_unlock(&fd_locks[fd]);
     return pos;
 }
 
